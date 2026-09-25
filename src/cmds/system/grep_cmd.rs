@@ -3,7 +3,7 @@
 use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
-use crate::core::utils::resolved_command;
+use crate::core::utils::{resolved_command, ChildArgExt};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -51,7 +51,9 @@ pub fn run(
         .or_else(|_| {
             let mut grep_cmd = resolved_command("grep");
             //When we fall back to grep,include all args, not just -rn.
-            grep_cmd.args(["-rn", pattern, path]).args(extra_args);
+            grep_cmd
+                .child_args(["-rn", pattern, path])
+                .child_args(extra_args);
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;

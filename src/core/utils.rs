@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -355,6 +356,172 @@ pub fn resolved_command(name: &str) -> Command {
     }
 }
 
+/// How a program linked to msys-2.0.dll (Git Bash's grep, ls, wc...) rebuilds
+/// its argv from the raw command line when a native process starts it
+/// (msys2-runtime, winsup/cygwin/dcrt0.cc: `build_argv`, `quoted`, `globify`).
+///
+/// It splits words on blanks, `\n` and `\r` included, takes `'` for a quote as
+/// well as `"`, reads a word starting with `@` as a response file and, unless
+/// `MSYS=noglob`, sends every word holding a quote or one of `?*[(){}`, or
+/// starting with `~`, through glob(), which expands braces and wildcards and
+/// drops backslashes. std quotes an argument only for a space or a tab, so
+/// `"(a|b)"` reached grep merged with the arguments after it, `it's` lost its
+/// quote, and `[0-9]{4}` became `[0-9]4`.
+// Windows-only in production; the rules stay unit-tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MsysArgv {
+    /// The default: quotes are kept for glob(), which reads `\\` and `\"` as
+    /// escapes inside double quotes and every other character there literally.
+    Glob,
+    /// `MSYS=noglob`: a quote runs to the next identical one, with no escape.
+    NoGlob,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl MsysArgv {
+    /// Encode `arg` so that this runtime reads it back intact.
+    fn quote(self, arg: &str) -> String {
+        match self {
+            MsysArgv::Glob => {
+                let mut out = String::with_capacity(arg.len() + 2);
+                out.push('"');
+                for ch in arg.chars() {
+                    if ch == '\\' || ch == '"' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+                out
+            }
+            // Nothing escapes a `"`: close the run, quote it with `'`, reopen.
+            MsysArgv::NoGlob => format!("\"{}\"", arg.replace('"', "\"'\"'\"")),
+        }
+    }
+}
+
+/// Whether the runtime could read `arg`, as std encodes it, as something else:
+/// it holds a blank, a quote, a glob or brace character, or starts with `~` or
+/// `@`. Every other argument keeps std's bytes, which the runtime reads back
+/// intact, and stays out of glob(), which cuts a word short past 8K characters.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_would_rewrite(arg: &str) -> bool {
+    arg.starts_with(['~', '@'])
+        || arg.contains(|c: char| c.is_ascii_whitespace() || "\"'?*[(){}".contains(c))
+}
+
+/// Pass caller-supplied arguments to a child so that MSYS2 programs on Windows
+/// receive them intact.
+///
+/// Use instead of `Command::arg`/`args` for anything that arrived on rtk's own
+/// command line: a pattern, a path, a flag value.
+pub trait ChildArgExt {
+    fn child_arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command;
+
+    fn child_args<I, S>(&mut self, args: I) -> &mut Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>;
+}
+
+impl ChildArgExt for Command {
+    fn child_arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command {
+        self.child_args([arg])
+    }
+
+    fn child_args<I, S>(&mut self, args: I) -> &mut Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let msys = msys_argv_of(self);
+        for arg in args {
+            push_child_arg(self, arg.as_ref(), msys);
+        }
+        self
+    }
+}
+
+#[cfg(windows)]
+fn msys_argv_of(cmd: &Command) -> Option<MsysArgv> {
+    msys_argv(
+        std::path::Path::new(cmd.get_program()),
+        &std::env::var("MSYS").unwrap_or_default(),
+    )
+}
+
+/// How `program` will read its command line, when it is an `.exe` with
+/// msys-2.0.dll beside it (Git for Windows' and MSYS2's `usr/bin`). Everything
+/// else stays on std's encoding: native tools, `.bat`/`.cmd` shims, which
+/// cmd.exe parses by its own rules, and launchers such as Git's `bin/bash.exe`,
+/// which hand their command line to an MSYS2 program and are not covered. A
+/// native `.exe` copied beside the runtime is taken for an MSYS2 one.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_argv(program: &std::path::Path, msys_options: &str) -> Option<MsysArgv> {
+    let is_msys = program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        && program
+            .parent()
+            .is_some_and(|dir| dir.join("msys-2.0.dll").is_file());
+    if !is_msys {
+        return None;
+    }
+    Some(if msys_glob_enabled(msys_options) {
+        MsysArgv::Glob
+    } else {
+        MsysArgv::NoGlob
+    })
+}
+
+/// Whether an MSYS2 runtime reading these `MSYS` options globs a native parent's
+/// command line: yes by default, the last `glob`/`noglob` option winning, and an
+/// empty `glob:` value meaning no (msys2-runtime, winsup/cygwin/environ.cc:
+/// `parse_options`, `glob_init`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msys_glob_enabled(options: &str) -> bool {
+    options
+        .split_whitespace()
+        .rev()
+        .find_map(|option| {
+            let (name, value) = match option.split_once([':', '=']) {
+                Some((name, value)) => (name, Some(value)),
+                None => (option, None),
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "glob" => Some(value != Some("")),
+                "noglob" | "-glob" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn push_child_arg(cmd: &mut Command, arg: &OsStr, msys: Option<MsysArgv>) {
+    match (msys, arg.to_str()) {
+        (Some(msys), Some(s)) if msys_would_rewrite(s) => {
+            std::os::windows::process::CommandExt::raw_arg(cmd, msys.quote(s));
+        }
+        _ => {
+            cmd.arg(arg);
+        }
+    }
+}
+
+/// Unix: the argument vector reaches `execvp` verbatim, so there is nothing to
+/// encode.
+#[cfg(not(windows))]
+fn msys_argv_of(_cmd: &Command) -> Option<MsysArgv> {
+    None
+}
+
+#[cfg(not(windows))]
+fn push_child_arg(cmd: &mut Command, arg: &OsStr, _msys: Option<MsysArgv>) {
+    cmd.arg(arg);
+}
+
 /// Check if a tool exists on PATH (PATHEXT-aware on Windows).
 ///
 /// Replaces manual `Command::new("which").arg(tool)` checks that fail on Windows.
@@ -638,6 +805,107 @@ mod tests {
         assert!(tool_exists("git"), "tool_exists('git') should return true");
     }
 
+    // ===== MSYS2 child argument quoting =====
+
+    #[test]
+    fn test_msys_glob_quote_keeps_the_reported_pattern_whole() {
+        // `grep -c -E '"(alias|dossier)"' file`: std left the quotes bare, and the
+        // MSYS2 runtime merged the pattern with the file name after it.
+        assert_eq!(
+            MsysArgv::Glob.quote(r#""(alias|dossier)""#),
+            r#""\"(alias|dossier)\"""#
+        );
+    }
+
+    #[test]
+    fn test_msys_glob_quote_doubles_every_backslash() {
+        assert_eq!(MsysArgv::Glob.quote(r"C:\a\\b"), r#""C:\\a\\\\b""#);
+        assert_eq!(MsysArgv::Glob.quote(r"trail\"), r#""trail\\""#);
+        assert_eq!(MsysArgv::Glob.quote(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn test_msys_glob_quote_leaves_the_rest_literal() {
+        // Inside the quotes, `'`, braces and wildcards are taken literally.
+        assert_eq!(
+            MsysArgv::Glob.quote("l'offre {2,3} *"),
+            r#""l'offre {2,3} *""#
+        );
+        assert_eq!(MsysArgv::Glob.quote(""), r#""""#);
+    }
+
+    #[test]
+    fn test_msys_noglob_quote_splices_each_double_quote() {
+        // Nothing escapes a `"` under noglob: it is quoted with `'` between two runs.
+        assert_eq!(
+            MsysArgv::NoGlob.quote(r#""(alias|dossier)""#),
+            r#"""'"'"(alias|dossier)"'"'"""#
+        );
+        // Backslashes and `'` are literal inside a run.
+        assert_eq!(
+            MsysArgv::NoGlob.quote(r"C:\a\\b l'offre"),
+            r#""C:\a\\b l'offre""#
+        );
+    }
+
+    #[test]
+    fn test_msys_would_rewrite_what_std_leaves_bare() {
+        for arg in [
+            r#""(alias|dossier)""#,
+            "it's",
+            "[0-9]{4}",
+            "*.txt",
+            "a?",
+            r"\(foo\)",
+            r"a b\\c",
+            "line1\nline2",
+            "~",
+            "@foo",
+        ] {
+            assert!(msys_would_rewrite(arg), "{:?}", arg);
+        }
+    }
+
+    #[test]
+    fn test_msys_would_rewrite_nothing_else() {
+        // These keep std's bytes, which the runtime reads intact, however long.
+        for arg in [
+            "-c",
+            "client.json",
+            r"C:\a\\b",
+            r"trail\",
+            "a~b",
+            "a@b",
+            "é",
+            "",
+        ] {
+            assert!(!msys_would_rewrite(arg), "{:?}", arg);
+        }
+        assert!(!msys_would_rewrite(&"a".repeat(9000)));
+    }
+
+    #[test]
+    fn test_msys_glob_enabled_by_default() {
+        assert!(msys_glob_enabled(""));
+        assert!(msys_glob_enabled("disable_pcon"));
+    }
+
+    #[test]
+    fn test_msys_glob_enabled_follows_the_last_glob_option() {
+        assert!(!msys_glob_enabled("disable_pcon noglob"));
+        assert!(!msys_glob_enabled("NOGLOB"));
+        assert!(!msys_glob_enabled("-glob"));
+        assert!(!msys_glob_enabled("glob noglob"));
+        assert!(msys_glob_enabled("noglob glob:ignorecase"));
+    }
+
+    #[test]
+    fn test_msys_glob_enabled_reads_an_empty_value_as_no() {
+        assert!(!msys_glob_enabled("glob:"));
+        assert!(!msys_glob_enabled("glob="));
+        assert!(msys_glob_enabled("glob:ignorecase"));
+    }
+
     // ===== Windows-specific PATHEXT resolution tests (issue #212) =====
 
     #[cfg(target_os = "windows")]
@@ -758,6 +1026,49 @@ mod tests {
                 result.is_err() || !result.unwrap().status.success(),
                 "nonexistent binary should fail to execute, but resolved_command must not panic"
             );
+        }
+
+        #[test]
+        fn test_msys_argv_for_an_exe_beside_the_msys_runtime() {
+            let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+            fs::write(temp_dir.path().join("msys-2.0.dll"), b"")
+                .expect("failed to create fake msys runtime");
+            let grep = temp_dir.path().join("grep.exe");
+
+            assert_eq!(msys_argv(&grep, ""), Some(MsysArgv::Glob));
+            assert_eq!(msys_argv(&grep, "noglob"), Some(MsysArgv::NoGlob));
+        }
+
+        #[test]
+        fn test_msys_argv_leaves_other_programs_on_stds_encoding() {
+            let msys_dir = tempfile::tempdir().expect("failed to create temp dir");
+            fs::write(msys_dir.path().join("msys-2.0.dll"), b"")
+                .expect("failed to create fake msys runtime");
+            let native_dir = tempfile::tempdir().expect("failed to create temp dir");
+
+            // A native .exe, a batch shim beside the runtime, a bare name.
+            for program in [
+                native_dir.path().join("grep.exe"),
+                msys_dir.path().join("gradlew.bat"),
+                std::path::PathBuf::from("grep"),
+            ] {
+                assert_eq!(msys_argv(&program, ""), None, "program: {:?}", program);
+            }
+        }
+
+        #[test]
+        fn test_child_args_encode_only_what_the_msys_runtime_would_rewrite() {
+            let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+            fs::write(temp_dir.path().join("msys-2.0.dll"), b"")
+                .expect("failed to create fake msys runtime");
+
+            let mut cmd = Command::new(temp_dir.path().join("grep.exe"));
+            cmd.child_args(["-c", r#""(alias|dossier)""#, r"C:\a\\b"]);
+            // The encoding follows the MSYS options this test runs under.
+            let msys = msys_argv_of(&cmd).expect("an MSYS2 program");
+            let pattern = msys.quote(r#""(alias|dossier)""#);
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, ["-c", pattern.as_str(), r"C:\a\\b"]);
         }
 
         #[test]
