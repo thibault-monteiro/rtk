@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{shell_split, split_on_operators, tokenize, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -73,6 +73,9 @@ lazy_static! {
     static ref TAIL_N_SPACE: Regex = Regex::new(r"^tail\s+-n\s+(\d+)\s+(\S+)$").unwrap();
     static ref TAIL_LINES_EQ: Regex = Regex::new(r"^tail\s+--lines=(\d+)\s+(\S+)$").unwrap();
     static ref TAIL_LINES_SPACE: Regex = Regex::new(r"^tail\s+--lines\s+(\d+)\s+(\S+)$").unwrap();
+    // `$VAR`, `${...}`, `$(...)`, backticks and a leading `~`: text the shell
+    // substitutes at run time.
+    static ref SHELL_EXPANSION: Regex = Regex::new(r"\$[A-Za-z0-9_{(]|`|^~").unwrap();
 }
 
 const GOLANGCI_GLOBAL_OPT_WITH_VALUE: &[&str] = &[
@@ -82,6 +85,26 @@ const GOLANGCI_GLOBAL_OPT_WITH_VALUE: &[&str] = &[
     "--cpu-profile-path",
     "--mem-profile-path",
     "--trace-path",
+];
+
+const GREP_SHORT_OPT_WITH_VALUE: &str = "ABCDXdefm";
+
+const GREP_LONG_OPT_WITH_VALUE: &[&str] = &[
+    "after-context",
+    "before-context",
+    "binary-files",
+    "context",
+    "devices",
+    "directories",
+    "exclude",
+    "exclude-dir",
+    "exclude-from",
+    "file",
+    "group-separator",
+    "include",
+    "label",
+    "max-count",
+    "regexp",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -336,6 +359,57 @@ fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
     }
 
     true
+}
+
+/// Whether a GNU grep argument other than a file operand (the pattern, an
+/// option, an option value) contains a `/`. Git Bash converts the arguments
+/// that look like POSIX paths when it starts a native program, so once `grep`
+/// becomes the native `rtk.exe`, `grep '/api/v1'` searches for
+/// `C:/Program Files/Git/api/v1`. File operands need that conversion, and Git
+/// Bash leaves alone any argument without a `/`. A value the shell fills in at
+/// run time (`"$P"`, `$(...)`) counts as having one, since it may.
+fn grep_non_operand_has_slash(args: &str) -> bool {
+    let args = shell_split(args);
+    let mut args = args.iter().map(String::as_str);
+    let mut non_operands = Vec::new();
+    let mut positionals = Vec::new();
+    let mut pattern_from_option = false;
+
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            positionals.extend(args.by_ref());
+        } else if let Some(long) = arg.strip_prefix("--") {
+            non_operands.push(arg);
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            // getopt_long also takes abbreviations; matching any prefix only checks more.
+            if !long.contains('=')
+                && GREP_LONG_OPT_WITH_VALUE
+                    .iter()
+                    .any(|opt| opt.starts_with(name))
+            {
+                non_operands.extend(args.next());
+            }
+            pattern_from_option |= name == "regexp" || name == "file";
+        } else if arg.len() > 1 && arg.starts_with('-') {
+            non_operands.push(arg);
+            let flags = &arg[1..];
+            if let Some(at) = flags.find(|c| GREP_SHORT_OPT_WITH_VALUE.contains(c)) {
+                pattern_from_option |= matches!(flags.as_bytes()[at], b'e' | b'f');
+                if at + 1 == flags.len() {
+                    non_operands.extend(args.next());
+                }
+            }
+        } else {
+            positionals.push(arg);
+        }
+    }
+
+    if !pattern_from_option {
+        non_operands.extend(positionals.first());
+    }
+    non_operands
+        .iter()
+        .any(|arg| arg.contains('/') || SHELL_EXPANSION.is_match(arg))
 }
 
 fn split_token_spans(cmd: &str) -> Vec<(&str, usize, usize)> {
@@ -811,6 +885,13 @@ fn rewrite_segment_inner(
         {
             return None;
         }
+    }
+
+    // Git Bash converts `/` arguments on their way to the native rtk.exe, while MSYS2
+    // grep got them intact. rg is native already: rewriting it changes nothing.
+    if cfg!(windows) && strip_word_prefix(cmd_part, "grep").is_some_and(grep_non_operand_has_slash)
+    {
+        return None;
     }
 
     // Try each rewrite prefix (longest first) with word-boundary check
@@ -1394,6 +1475,89 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("rg \"fn main\"", &[]),
             Some("rtk grep \"fn main\"".into())
+        );
+    }
+
+    #[test]
+    fn test_grep_non_operand_has_slash_in_pattern_or_option() {
+        for args in [
+            "-c '/api/v1' routes.txt",
+            "-rn '// TODO' src/",
+            "-rn '</div>' .",
+            "-e /api -e /v2 app.log",
+            "-rne/api .",
+            "--regexp=/api .",
+            "--reg /api app.log",
+            "--inc '*.rs' /api src",
+            "--include=src/*.rs -rn foo .",
+            "-- /api routes.txt",
+            "/api routes.txt -n",
+            "--color /api app.log",
+            "-5 /api src/",
+            "-e '' -e /api app.log",
+            "-rn --include='*.ts' \\\n  '/api/v1' src/",
+            "-c \"$P\" routes.txt",
+            "-c \"$(cat p.txt)\" routes.txt",
+            "-c `cat p.txt` routes.txt",
+            "-rn ~ src/",
+        ] {
+            assert!(grep_non_operand_has_slash(args), "{:?}", args);
+        }
+    }
+
+    #[test]
+    fn test_grep_non_operand_has_slash_ignores_file_operands() {
+        for args in [
+            "-rn foo src/ /c/Projets/x.json",
+            "-e foo src/x.txt",
+            "-A 3 foo src/",
+            "-rnA3 foo src/",
+            "--exclude-dir node_modules foo src/",
+            "--include=*.rs -rn foo src/",
+            "-f patterns.txt src/",
+            "foo -",
+            "--color foo src/",
+            "-e foo -- /c/x",
+            "-rn '^foo$' src/",
+            "-rn foo \"$DIR\"",
+            "-rn foo ~/notes",
+        ] {
+            assert!(!grep_non_operand_has_slash(args), "{:?}", args);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_rewrite_keeps_grep_raw_when_git_bash_would_convert_pattern() {
+        for cmd in [
+            "grep -c '/api/v1' routes.txt",
+            "LC_ALL=C grep -c '/api/v1' routes.txt",
+            "command grep -c '/api/v1' routes.txt",
+            "grep -c '/api/v1' routes.txt 2>/dev/null",
+            "grep -c '/api/v1' routes.txt | head",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{:?}", cmd);
+        }
+        assert_eq!(
+            rewrite_command_no_prefixes("git status && grep -rn '// TODO' src/", &[]),
+            Some("rtk git status && grep -rn '// TODO' src/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("grep -rn foo src/", &[]),
+            Some("rtk grep -rn foo src/".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("rg '/api/v1' src/", &[]),
+            Some("rtk grep '/api/v1' src/".into())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_rewrite_grep_pattern_with_slash_outside_windows() {
+        assert_eq!(
+            rewrite_command_no_prefixes("grep -c '/api/v1' routes.txt", &[]),
+            Some("rtk grep -c '/api/v1' routes.txt".into())
         );
     }
 

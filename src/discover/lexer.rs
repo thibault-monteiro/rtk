@@ -321,35 +321,42 @@ pub fn strip_quotes(s: &str) -> String {
 pub fn shell_split(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut in_word = false;
     let mut chars = input.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
 
     while let Some(c) = chars.next() {
         match c {
-            '\\' if !in_single => {
-                if let Some(next) = chars.next() {
+            '\\' if !in_single => match chars.next() {
+                Some('\n') | None => {}
+                Some(next) => {
                     current.push(next);
+                    in_word = true;
                 }
-            }
+            },
             '\'' if !in_double => {
                 in_single = !in_single;
+                in_word = true;
             }
             '"' if !in_single => {
                 in_double = !in_double;
+                in_word = true;
             }
             ' ' | '\t' if !in_single && !in_double => {
-                if !current.is_empty() {
+                if in_word {
                     tokens.push(std::mem::take(&mut current));
+                    in_word = false;
                 }
             }
             _ => {
                 current.push(c);
+                in_word = true;
             }
         }
     }
 
-    if !current.is_empty() {
+    if in_word {
         tokens.push(current);
     }
 
@@ -980,6 +987,23 @@ mod tests {
     #[test]
     fn test_shell_split_multiple_spaces() {
         assert_eq!(shell_split("a   b   c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_shell_split_line_continuation() {
+        assert_eq!(
+            shell_split("grep -rn \\\n  '/api' src/"),
+            vec!["grep", "-rn", "/api", "src/"]
+        );
+        assert_eq!(shell_split("a\\\nb"), vec!["ab"]);
+    }
+
+    #[test]
+    fn test_shell_split_keeps_empty_quoted_args() {
+        assert_eq!(
+            shell_split(r#"grep -e '' -e "" f"#),
+            vec!["grep", "-e", "", "-e", "", "f"]
+        );
     }
 
     #[test]
