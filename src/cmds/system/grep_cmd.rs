@@ -35,6 +35,13 @@ pub fn run(
     // Using --no-ignore-vcs (not --no-ignore) so .ignore/.rgignore are still respected.
     rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
 
+    // Searching a single file, rg and grep leave out the file name, and a match whose
+    // content holds a `:` then parses as `file:line`. Passthrough flags keep their output.
+    let passthrough = has_format_flag(extra_args);
+    if !passthrough {
+        rg_cmd.arg("--with-filename");
+    }
+
     if let Some(ft) = file_type {
         rg_cmd.arg("--type").arg(ft);
     }
@@ -51,15 +58,13 @@ pub fn run(
         .or_else(|_| {
             let mut grep_cmd = resolved_command("grep");
             //When we fall back to grep,include all args, not just -rn.
-            grep_cmd
-                .child_args(["-rn", pattern, path])
-                .child_args(extra_args);
+            grep_cmd.child_args(grep_fallback_args(pattern, path, extra_args, passthrough));
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;
 
     // Passthrough output flags that produce output that is already small.
-    if has_format_flag(extra_args) {
+    if passthrough {
         print!("{}", result.stdout);
         if !result.stderr.is_empty() {
             eprint!("{}", result.stderr.trim());
@@ -110,15 +115,7 @@ pub fn run(
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     for line in result.stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-
-        let (file, line_num, content) = if parts.len() == 3 {
-            let ln = parts[1].parse().unwrap_or(0);
-            (parts[0].to_string(), ln, parts[2])
-        } else if parts.len() == 2 {
-            let ln = parts[0].parse().unwrap_or(0);
-            (path.to_string(), ln, parts[1])
-        } else {
+        let Some((file, line_num, content)) = parse_match_line(line, path) else {
             continue;
         };
 
@@ -168,6 +165,22 @@ pub fn run(
     Ok(exit_code)
 }
 
+/// Arguments of the grep fallback: `-H` names the file even when `path` is a single file,
+/// except under a passthrough flag whose output must stay as grep prints it.
+fn grep_fallback_args<'a>(
+    pattern: &'a str,
+    path: &'a str,
+    extra_args: &'a [String],
+    passthrough: bool,
+) -> Vec<&'a str> {
+    let mut args = vec!["-rn", pattern, path];
+    if !passthrough {
+        args.push("-H");
+    }
+    args.extend(extra_args.iter().map(String::as_str));
+    args
+}
+
 fn has_format_flag(extra_args: &[String]) -> bool {
     extra_args.iter().any(|arg| {
         matches!(
@@ -180,9 +193,32 @@ fn has_format_flag(extra_args: &[String]) -> bool {
                 | "-o"
                 | "--only-matching"
                 | "-Z"
+                | "-0"
                 | "--null"
         )
     })
+}
+
+/// Splits a `file:line:content` match line. A `line:content` line (no file name) belongs to
+/// `path`. A Windows drive prefix (`C:/`, `C:\`) stays in the file name: Git Bash hands
+/// rtk.exe absolute paths as `C:/...` and grep prints them back as given.
+fn parse_match_line<'a>(line: &'a str, path: &str) -> Option<(String, usize, &'a str)> {
+    let drive = match line.as_bytes() {
+        [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic() => 2,
+        _ => 0,
+    };
+    let (prefix, rest) = line.split_at(drive);
+    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+
+    match parts.as_slice() {
+        [file, ln, content] => Some((
+            format!("{}{}", prefix, file),
+            ln.parse().unwrap_or(0),
+            content,
+        )),
+        [ln, content] => Some((path.to_string(), ln.parse().unwrap_or(0), content)),
+        _ => None,
+    }
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -362,6 +398,7 @@ mod tests {
     #[test]
     fn test_format_flag_detects_null() {
         assert!(has_format_flag(&["-Z".to_string()]));
+        assert!(has_format_flag(&["-0".to_string()]));
         assert!(has_format_flag(&["--null".to_string()]));
     }
 
@@ -373,6 +410,57 @@ mod tests {
             "-A".to_string(),
             "3".to_string(),
         ]));
+    }
+
+    // --- match line parsing ---
+
+    #[test]
+    fn test_parse_match_line_keeps_windows_drive() {
+        // Git Bash hands rtk.exe absolute paths as `C:/...`; grep prints them back as given.
+        let line = "C:/Users/me/t/a.txt:2:beta foo";
+        assert_eq!(
+            parse_match_line(line, "C:/Users/me/t"),
+            Some(("C:/Users/me/t/a.txt".to_string(), 2, "beta foo"))
+        );
+        let line = r"C:\Users\me\t\a.txt:12:x";
+        assert_eq!(
+            parse_match_line(line, "."),
+            Some((r"C:\Users\me\t\a.txt".to_string(), 12, "x"))
+        );
+    }
+
+    #[test]
+    fn test_parse_match_line_content_with_colon() {
+        assert_eq!(
+            parse_match_line("one.txt:4:foo: 2", "one.txt"),
+            Some(("one.txt".to_string(), 4, "foo: 2"))
+        );
+    }
+
+    #[test]
+    fn test_parse_match_line_without_file_name() {
+        // `--no-filename` from the user: the line belongs to `path`.
+        assert_eq!(
+            parse_match_line("6:foo 3", "one.txt"),
+            Some(("one.txt".to_string(), 6, "foo 3"))
+        );
+        assert_eq!(parse_match_line("no separator", "one.txt"), None);
+    }
+
+    #[test]
+    fn test_grep_fallback_names_the_file() {
+        // Without -H, `grep -rn foo one.txt` prints `4:foo: 2` and the match parses as file `4`.
+        let extra = vec!["-i".to_string()];
+        assert_eq!(
+            grep_fallback_args("foo", "one.txt", &extra, has_format_flag(&extra)),
+            ["-rn", "foo", "one.txt", "-H", "-i"]
+        );
+        // `grep -c foo one.txt` must still print `3`, not `one.txt:3`.
+        let extra = vec!["-c".to_string()];
+        assert_eq!(
+            grep_fallback_args("foo", "one.txt", &extra, has_format_flag(&extra)),
+            ["-rn", "foo", "one.txt", "-c"]
+        );
     }
 
     // Verify line numbers are always enabled in rg invocation (grep_cmd.rs:24).
